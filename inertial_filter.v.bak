@@ -1,0 +1,42 @@
+From: "Saved by Internet Explorer 11"
+Subject: 
+Date: Mon, 8 May 2017 11:15:54 +1000
+MIME-Version: 1.0
+Content-Type: text/html;
+	charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+Content-Location: https://ecse.monash.edu//ucourses/ece4075/inertial_filter.v
+X-MimeOLE: Produced By Microsoft MimeOLE V6.1.7601.23651
+
+=EF=BB=BF<!DOCTYPE HTML>
+<!DOCTYPE html PUBLIC "" ""><HTML><HEAD><META content=3D"IE=3D11.0000"=20
+http-equiv=3D"X-UA-Compatible">
+
+<META http-equiv=3D"Content-Type" content=3D"text/html; =
+charset=3Dutf-8">
+<META name=3D"GENERATOR" content=3D"MSHTML 11.00.9600.18639"></HEAD>
+<BODY>
+<PRE>module inertial_filter(clk, CE, synch_reset, data_in, data_out);=0A=
+input clk, CE, data_in, synch_reset;=0A=
+output reg data_out;=0A=
+=0A=
+localparam CONSEC_COUNT =3D 10;=0A=
+=0A=
+reg [3:0] count;=0A=
+=0A=
+always @(posedge clk)=0A=
+if (CE) begin=0A=
+	if (synch_reset) begin=0A=
+			count &lt;=3D 0;=0A=
+			data_out &lt;=3D data_in;=0A=
+	end else if (data_out =3D=3D data_in) =0A=
+			count &lt;=3D 0;=0A=
+		else if (count =3D=3D CONSEC_COUNT-1) begin=0A=
+			data_out &lt;=3D data_in;=0A=
+			count &lt;=3D 0;=0A=
+		end else=0A=
+			count &lt;=3D count + 1'b1;=0A=
+end=0A=
+=0A=
+endmodule=0A=
+</PRE></BODY></HTML>

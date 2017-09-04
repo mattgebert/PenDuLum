@@ -1,0 +1,908 @@
+#include <stdio.h>
+#include "includes.h"
+#include "system.h"
+#include "alt_types.h"
+#include "sys/alt_irq.h" //needed only if using interrupts
+//#include <priv/alt_legacy_irq.h>
+#include "io.h"
+#include "altera_up_avalon_parallel_port.h"
+#include <math.h>
+//#include "altera_avalon_pio_regs.h"
+
+
+/* Definition of Constants */
+typedef INT8U bool;
+#define false 0
+#define true 1
+#define NUM_SAMPLES sizeof(dataStack) / sizeof(dataStack[0]) //= Main Cycle Iterations
+#define NUM_CYCLES 600
+#define bufferSize sizeof(integratorError) / sizeof(integratorError[0])
+int const PERIOD_MAX = 30000000; //uS, ==2.5s
+
+/* Definition of Global Variables */
+int dataStack[1000],	//Saves values for processing later.
+dataStack2[1000],
+dataStack3[1000];
+int globalTime;
+int err; 												//Error Pointer
+int angle; 												//Encoder Controlled
+int encoder_edges; 										//Encoder Edge Captures.
+int encoder_status; 									//Endcoder High/Low Catpures.
+int beam_edges; 										//Beam Edge Captures.
+int beam_status; 										//Beam High/Low Catpures.
+INT8U ledgstat = 0xFF; 									//LEDS ON OR OFF.
+static int start_time; 									//Timer counter for Microseconds.
+static int dataPointer;									//Holds pointer of memory array.
+int Ki;	// 24:8 Fractional Bits --> [0-255 are Fractional]
+int Kp, Kd;	// 16:16 Fractional Bits --> [0 - 65535 are Fractional]
+int integratorError[15];								//Holds past 15 integer values for integrator error.
+static int desiredAngle;								//Desired Angle to rotate to.
+int Time[3];											//Time between beam trigger interrupts
+int period;												//Time between sequential beam interrupts
+int beamCount = 0;										//Counts the ISR's of Beam
+int speed = 0;											// Speed of pendulum
+int direction = 0;										//Persistent Direction
+int thetaMax; 											//Maximum predicted turn of pendulum.
+int R;													//Calculated COM Radius.
+static int KEYRegs;										//Keys
+static int SWRegs;										/*SW[17]			Increments vs Degrees;
+ *SW[16]&!SW[15]	Change Kd
+ *!SW[16]&SW[15]	Change Ki
+ *SW[16]&SW[15]		Change Kp
+ */
+
+/* Definition of Function Declarations */
+static void 	EncoderISR(void * isr_context, alt_u32 id);
+static void 	BeamISR(void * isr_context, alt_u32 id); /*UPDATED*/
+void 			OpenPortDevs(void);
+int 			MultiSevenSeg (int value);
+void 			OpenPortDevs(void);
+void			CE(INT32U x);
+void			InitMicrosecs(void);
+int				GetMicrosecs(void);
+int				subOverflow(int a, int b);
+int 			multOverflow(int a, int b);
+int				addOverflow(int a, int b);
+void			zeiglerNicholsConstants(void);
+void			captureMatlabData(void);
+void			addIntegratorValue(int a);
+int				getIntegratorTotal(void);
+
+/* Semaphores */
+OS_EVENT * sem_encoder_change; //Signal for requiring encoder processing
+OS_EVENT * sem_end_operations; //Allows printing of data after X cycles.
+OS_EVENT * sem_beam_change; //Signal for requiring beam processing
+OS_EVENT * sem_tracking; //We have time & speed etc, now update motor?
+OS_EVENT * sem_motorUpdate; //Check if the motor needs to update a new direction speed etc.
+
+/* Definition of Global Pointers */
+alt_up_parallel_port_dev *usecs_dev;
+alt_up_parallel_port_dev *LEDGreen_dev;
+alt_up_parallel_port_dev *LEDRed_dev;
+alt_up_parallel_port_dev *HexDisplay3to0_dev;
+alt_up_parallel_port_dev *HexDisplay7to4_dev;
+alt_up_parallel_port_dev *KeyButtons_dev;
+alt_up_parallel_port_dev *SliderSW_dev;
+alt_up_parallel_port_dev *jtag_uart_0_dev;
+alt_up_parallel_port_dev *sram_0_dev;
+alt_up_parallel_port_dev *timer_0_dev;
+alt_up_parallel_port_dev *pio_encoder_dev;
+alt_up_parallel_port_dev *motor_voltage_dev;
+alt_up_parallel_port_dev *beam_dev;
+void * context;
+
+/* Definition of Task Stacks */
+#define   TASK_STACKSIZE       2048
+OS_STK		encoder_change_stk[TASK_STACKSIZE];
+OS_STK		beam_change_stk[TASK_STACKSIZE];
+OS_STK		display_angle_stk[TASK_STACKSIZE];
+OS_STK		PID_stk[TASK_STACKSIZE];
+OS_STK		end_operations_stk[TASK_STACKSIZE];
+OS_STK		gain_constant_stk[TASK_STACKSIZE];
+OS_STK		tracking_stk[TASK_STACKSIZE];
+OS_STK		motor_setting_stk[TASK_STACKSIZE];
+
+/* Definition of Task Priorities */
+
+#define beam_change_PRIORITY		1
+#define encoder_change_PRIORITY		2
+#define motor_setting_PRIORITY		3
+#define tracking_PRIORITY     		4
+#define display_angle_PRIORITY     	5
+//#define gain_constant_PRIORITY 		6
+#define PID_PRIORITY      			7
+
+#define end_operations_PRIORITY		8
+
+
+
+
+
+void beam_change_task(void* pdata)
+{
+	int a, b; //Holds microsecond counters.
+	int p, p2;
+	//Measurement of max period with weight at Top: 11.5/10 == 1.15s
+	//Measurement of max period with weight at Bottom: ?
+	//					 2147483647;
+	int dir; //Holds local version of direction.
+
+	while (1)
+	{
+		OSSemPend(sem_beam_change, 0, (void*) &err);
+		a = GetMicrosecs();
+		p += a;
+		if(beamCount == 0) {
+			p = a;
+			InitMicrosecs(); //0.8s --> 800,000 	 IntMax
+			//printf("Reset Microsecs\n");
+			b = 0;
+		}
+		else {
+			Time[beamCount-1] = a-b;
+			b = a;
+		}
+
+
+		//Staggered Direction to update on 0 Degrees pass
+		if(dir == -1  && beamCount == 2) {
+			//printf("Direction Updated No.1 Dir=-1 BC=2\n");
+			direction = -dir;
+			OSSemPost(sem_motorUpdate);
+		} else if (dir == 1 && beamCount == 1) {
+			//printf("Direction Updated No.2 Dir=1  BC=1\n");
+			direction = -dir;
+			OSSemPost(sem_motorUpdate);
+		}
+
+		if(beamCount == 3){
+			//printf("%d\t%d\t%d\n",Time[0],Time[1],Time[2]);
+			if (Time[0] > 3*Time[1]){				// AUTO correction 	/*|*/
+				beamCount = 3;											/*|*/
+				Time[0] = Time[1];										/*|*/
+			}															/*|*/
+			else if (Time[1] > 3*Time[0]){								/*|*/
+				beamCount = 2;											/*|*/
+				Time[1] = Time[0];										/*|*/
+			}															/*|*/
+			else if (Time[2] > 3*Time[1]){								/*|*/
+				beamCount = 1;											/*|*/
+				Time[2] = Time[0]*2;									/*|*/
+			}															/*|*/
+			else{														/*|*/
+				beamCount = 0;											/*|*/
+				if (p+p2 < PERIOD_MAX)									/*|*/
+					period = p + p2; //Tracked period					/*|*/
+				else
+					printf("Larger than max period!\n");
+				p2 = p;													/*|*/
+				//Update Direction in beam change.
+				if(Time[0] > Time[2]) {
+					dir = -1; //printf("Anti Clockwise\n");
+				} else {
+					dir = 1; //printf("Clockwise\n");
+				}
+				OSSemPost(sem_tracking);								/*|*/
+			}															/*v*/
+		} else {
+			beamCount++;
+		}
+	}
+}
+
+void encoder_change_task(void* pdata)
+{
+
+	while (1)
+	{
+		OSSemPend(sem_encoder_change, 0, (void*) &err);
+		//Process as required... we need to update angle counter!!
+		INT8U a,b;
+		a = ((encoder_status&0x1) == 0x1);
+		b = ((encoder_status&0x2) == 0x2);
+
+		if (encoder_edges == 0x1){ //Phase A.
+			if(a^b) {
+				angle++;
+			} else {
+				angle--;
+			}
+		} else if (encoder_edges == 0x2) {
+			if(a^b) {
+				angle--;
+			} else {
+				angle++;
+			}
+		} else {
+			//printf("Erroneous Edge Capture value of %d.\n", encoder_edges); //TODO: uncomment
+		}
+	}
+}
+
+void motor_setting_task(void* pdata) {
+	//To predict motion of pendulum as a function of time.
+	int const sin[31] = {0,105,208,309,407,500,588,669,743,809,866,914,951,978,995,1000,995,978,951,914,866,809,743,669,588,500,407,309,208,105,0};
+	int t, t_ahead, t_prior; 			//Time values, rounded to ahead and behind.	Range 0 to 1000.
+	int interpolatedVal;				//Calculated value to be set to desiredAngle
+	int internalAngle;					//
+	INT8U index; //unsigned
+	int internalDirection;
+	bool predicting;
+
+	while(1) {
+		t = GetMicrosecs();														//printf("t=%d\n",t);
+		int a = OSSemAccept(sem_motorUpdate);
+		if (a > 0) {
+			//Update internal direction and speed.
+			internalDirection = -direction;										//printf("Registered direction from Beam Encoder.\n");
+			predicting = 0;
+			//
+		}
+
+		t = ((200 * t) / (period/10)); //Fraction of where to in half period cycle we are up to. Range 0 to 1000. CAREFUL OVERFLOW
+		//PREDICTOR
+		t = t + 160;	//period/(10000); //To look ahead, add extra value to time.			//period ~ 1,600,000 uS --> 160.
+
+		if (t > 1000) { //Predictor has driven estimation into next cycle. Requires direction change.
+			if(predicting == 0) {
+				internalDirection *= -1;										//printf("Predicting new direction...\n");
+				predicting = 1;
+			}
+			if(t>2000 && predicting) {
+				predicting = 0;													//printf("Internally Reset Microsecs & Direction\n");
+				InitMicrosecs(); //Reset timer
+				internalDirection *= -1; //Return to original prediction orientation
+			}
+			t = t%1000;
+		}
+
+		if (t == 0) {
+			index = 1; //Half Period - rounds up
+		} else {
+			index = (t*30)/1000 + 1; //Half Period - rounds up
+			if(index > 30) {
+				//printf("ERROR %d\n", index); //TODO: Uncomment
+				index = 30;
+			}
+		}
+
+		//ahead and prior values, deltaT = 1000/30;
+		t_ahead = (index * 1000) / 30;
+		t_prior = ((index-1)* 1000) / 30;									//printf("Tvals Scaled:\tt=%d\tt_a=%d\tt_p=%d\n", t, t_ahead, t_prior);
+
+		//As t interval increases, more use of ahead sin value.
+		int sin_ahead = (sin[index] * (t - t_prior)) *30 / (1000);
+		int sin_prior = (sin[index-1] * (t_ahead-t)) *30 / (1000); 		//printf("Sinvals:\tsina = %d\tsinp = %d\n",sin_ahead, sin_prior);
+		interpolatedVal = (sin_ahead + sin_prior); //desiredAngle * 10^6
+		internalAngle = (thetaMax * internalDirection * interpolatedVal)/1000;
+
+		if (t_prior <= t && t_ahead >= t){
+			desiredAngle = internalAngle;
+			//printf("Index:\t%d\tDesired Angle:\t%d\t%d\t%d\n", index, internalAngle, internalDirection, t);
+		} else {
+			//printf("What on earth. t=%d\n",t); //TODO:Ucomment
+		}
+
+		OSTimeDlyHMSM(0,0,0,10);
+	}
+}
+
+void tracking_task(void* pdata)
+{
+	int const L = 580; //mm
+	while (1)
+	{
+		OSSemPend(sem_tracking, 0, (void*) &err);
+		speed = 30000000/(Time[0]+Time[2]);  // Speed in m pr 1000*s
+
+		//We need to calculate R given V, T and L.
+		//Period in microseconds, V in mm/s, L
+		//Record R in mm.
+		R = (period/1000) * (period/1000) / 4028;// * 980) / (39476 * ); //period^2 * g / (4pi^2) /40281632653
+
+		// mm/s * us / mm * const -> uTurns		//Rad -> Deg * Deg -> Turns = 318.
+		// 2*Pi = 6.283, 						//6283/318 =  19.757861635220125786163522012579
+		thetaMax = (((speed/10) * (period)) / (L * 1975)); //Turns
+	}
+}
+
+void display_angle_task(void* pdata)
+{
+	int displaySW;
+	while (1)
+	{
+		//Check Port for SW value.
+		displaySW = (alt_up_parallel_port_read_data(SliderSW_dev) & 0x1); //SW[0] gives display.
+
+		//Determine Whether to output Revs Tics or Degrees
+		int displayVal;
+		if (displaySW) { // High = Degrees
+			displayVal = ((angle)*360)/2000;
+		} else { // Low = Revs/Rotations
+			displayVal = angle;
+		}
+
+		alt_up_parallel_port_write_data(HexDisplay3to0_dev, MultiSevenSeg(displayVal));
+		OSTimeDlyHMSM(0, 0, 0, 50);
+		//printf("I did it\n");
+	}
+}
+
+
+//Purpose of updating gain registers.
+/*void gain_constant_update_task(void* Pdata) {
+	while(1) {
+		//Data
+		SWRegs = alt_up_parallel_port_read_data(SliderSW_dev);
+		KEYRegs = alt_up_parallel_port_read_data(KeyButtons_dev);
+
+		//Controllable Angle //SW[13].
+		//desiredAngle = ((SWRegs >> 14) & 0x1)? 0 : 020;
+
+
+		//Gain Selector?
+		int selection = ((SWRegs>>15) & 0x7);
+		//Update Flags?
+		INT8U update = (KEYRegs & 0x2) >> 1;
+
+		//Update Gain Values
+		int gainVal = (SWRegs & 0x3FFF); //SW[12:0].
+
+		switch(selection){
+		case 1: //Ki
+			if(update)	Ki = gainVal;
+			alt_up_parallel_port_write_data(LEDRed_dev, Ki);
+			alt_up_parallel_port_write_data(HexDisplay7to4_dev, MultiSevenSeg(Ki));
+			break;
+		case 2: //Kd
+			if(update)	Kd = gainVal;
+			alt_up_parallel_port_write_data(LEDRed_dev, Kd);
+			alt_up_parallel_port_write_data(HexDisplay7to4_dev, MultiSevenSeg(Kd));
+			break;
+		case 3: //Kp
+			if(update)	Kp = gainVal;
+			alt_up_parallel_port_write_data(LEDRed_dev, Kp);
+			alt_up_parallel_port_write_data(HexDisplay7to4_dev, MultiSevenSeg(Kp));
+			break;
+		default:
+			alt_up_parallel_port_write_data(HexDisplay7to4_dev, MultiSevenSeg(desiredAngle));
+			break;
+		}
+
+		OSTimeDlyHMSM(0,0,0,300);
+	}
+}*/
+
+void PID_task(void* pdata)
+{
+
+	int AngleErr, preAngleErr, voltage;
+	int PGain,IntGain, DiffGain, FullIntGain;
+
+	//desiredAngle = 500;//250; //inialize desired angle to 250, ie a 1/8 turn.
+	preAngleErr = 0;
+
+	//zeiglerNicholsConstants(); //Setup Kp, Kd, Ki.
+
+	//Driving Hard
+	/*Kp = 4000;
+	Ki = 30000;//138;
+	Kd = 23000;//9000;*/
+
+	//Driving Slower
+	/*Kp = 1500;
+	Ki = 50000;
+	Kd = 15000;*/
+
+	//Drive even slower
+	Kp = 1200;
+	Ki = 3000;
+	Kd = 15500;
+
+	//Drive Even slower v2
+
+
+	//Limits
+	const int MAXVOLTAGE =  511; 	//10 bit signed (Defined in PWM module)
+	const int MINVOLTAGE = -512; 	//10 bit signed (Defined in PWM module)
+	const int MAXINTGAIN =  33554432; //Define MaxIntGain - avoids windup
+	//Start Time Capture.
+	InitMicrosecs();
+
+	while (1)
+	{
+		//TO BLOCK TASKS, UNCOMMENT THE FOLLOWING LINE AND CHANGE THE STACK LENGTH OF dataStack.
+		OSSemPend(sem_end_operations, 0, (void*) &err); //Stop running after X iterations.
+
+		SWRegs = (alt_up_parallel_port_read_data(SliderSW_dev));
+		//angleSW =  SWRegs & (0x03FFF); //Lowest 13 Bits
+
+		AngleErr 	= desiredAngle + angle ; //Note, still an error, angle is signed
+		//Store Current Error in Integrator Buffer
+		addIntegratorValue(AngleErr);
+
+		PGain		= Kp * AngleErr;
+		DiffGain	= Kd * (AngleErr - preAngleErr);
+		IntGain		= Ki * getIntegratorTotal();
+		// Check Integral Gain Maximum
+		if((IntGain) > MAXINTGAIN){
+			IntGain = MAXINTGAIN;
+		} else if ((IntGain) < -MAXINTGAIN){
+			IntGain = -MAXINTGAIN;
+		}
+		//Determine Output Integral Gain
+		FullIntGain = (128+IntGain)/256; //128 rounds up. 256 bit shifts 2^8.
+
+		// Final calculation
+		voltage = (DiffGain+PGain+FullIntGain+128)/256; //128 rounds up. 256 bit shifts 2^8
+
+		// Check voltage Maximums
+		if(voltage > MAXVOLTAGE){
+			voltage = MAXVOLTAGE;
+		} else if(voltage < MINVOLTAGE){
+			voltage = MINVOLTAGE;
+		}
+
+		// Send voltage to PWM module
+		alt_up_parallel_port_write_data(motor_voltage_dev, voltage);
+
+		//Hold previous error.
+		preAngleErr = AngleErr;
+
+		//Save Data to Stack.
+
+		if(dataPointer < NUM_SAMPLES){
+			//Angle
+			dataStack[dataPointer] = -angle;
+			//Voltage
+			dataStack2[dataPointer] = voltage;
+			//Time Stamp
+			dataStack3[dataPointer++] = GetMicrosecs();
+			//Make sure to increment dataPointer.
+		}
+
+
+		OSTimeDlyHMSM(0, 0, 0, 10);
+		//Display angle or voltage with SW17.
+		/*int display = (SWRegs & (0x20000)) >> 17;
+			if (display)
+				alt_up_parallel_port_write_data(HexDisplay7to4_dev, MultiSevenSeg(voltage));
+			else
+				alt_up_parallel_port_write_data(HexDisplay7to4_dev, MultiSevenSeg(AngleErr));
+		 */
+
+	}
+}
+
+void end_operations_task(void* Pdata) {
+	INT8U printed = 0;
+	while(1) {
+		int a = OSSemAccept(sem_end_operations);
+		if (a == 0 && !printed) {
+			printf("Process & Data Acquisition Finished!\n");
+			//No more regular operations can occur due to end operations semaphore! Time to process!!
+
+			captureMatlabData();
+
+			/* Example: Find an average of the time taken to run a specific task --> need to modify task to capture runtime though! */
+			/*
+					int i;
+					int timeTotal;
+					for (i = 0; i < dataPointer; i++) {
+						timeTotal += dataStack[i];
+						printf("i:%d\t%d\n",i,dataStack[i]);
+					}
+					printf("Average Time of Main Loop:\t%d\n", timeTotal/dataPointer);
+			 */
+
+			printf("It is well, it is well, with my soul!\n");
+			printed = 1;
+		} else if(printed) {
+			OSSemPost(sem_end_operations);
+		} else {
+			OSTimeDlyHMSM(0,0,0,100);
+		}
+	}
+
+}
+
+
+/* The main function creates two task and starts multi-tasking */
+int main(void)
+{
+	//Open Devices for communication:
+	OpenPortDevs();
+
+	//Clear any interrupts
+	IOWR(PIO_ENCODER_BASE, 3, 0); // clear encoder PIO interrupt capture register.
+	IOWR(BEAM_BASE, 3, 0); // clear encoder PIO interrupt capture register.
+	//Setup interrupt mask.
+	IOWR(PIO_ENCODER_BASE, 2, 0x3); //Enable lowest two bits.
+	IOWR(BEAM_BASE, 2, 0x1); //Enable lowest two bits.
+
+	// registers and enables encoder_IRQ to interrupt
+	alt_irq_register(PIO_ENCODER_IRQ, context, (void*) EncoderISR); // (void*)	printf("After ALR_IRQ_REG...\n");
+	alt_irq_register(BEAM_IRQ, context, (void*) BeamISR); // (void*)	printf("After ALR_IRQ_REG...\n");
+
+	//Create Semaphores
+	sem_encoder_change 		= OSSemCreate(0);
+	sem_beam_change			= OSSemCreate(0);
+	sem_tracking			= OSSemCreate(0);
+	sem_motorUpdate			= OSSemCreate(0);
+	if(NUM_SAMPLES < NUM_CYCLES) //Check memory pointer of data saving will not overshoot.
+		sem_end_operations = OSSemCreate(NUM_CYCLES);
+	else
+		sem_end_operations = OSSemCreate(NUM_SAMPLES);
+
+	//Create Timer start.
+	start_time = 0;
+
+
+	OSTaskCreateExt(encoder_change_task,
+			NULL,
+			(void *)&encoder_change_stk[TASK_STACKSIZE-1],
+			encoder_change_PRIORITY,
+			encoder_change_PRIORITY,
+			encoder_change_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	OSTaskCreateExt(beam_change_task,
+			NULL,
+			(void *)&beam_change_stk[TASK_STACKSIZE-1],
+			beam_change_PRIORITY,
+			beam_change_PRIORITY,
+			beam_change_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	OSTaskCreateExt(display_angle_task,
+			NULL,
+			(void *)&display_angle_stk[TASK_STACKSIZE-1],
+			display_angle_PRIORITY,
+			display_angle_PRIORITY,
+			display_angle_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	OSTaskCreateExt(PID_task,
+			NULL,
+			(void *)&PID_stk[TASK_STACKSIZE-1],
+			PID_PRIORITY,
+			PID_PRIORITY,
+			PID_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	OSTaskCreateExt(end_operations_task,
+			NULL,
+			(void *)&end_operations_stk[TASK_STACKSIZE-1],
+			end_operations_PRIORITY,
+			end_operations_PRIORITY,
+			end_operations_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	/*OSTaskCreateExt(gain_constant_update_task,
+			NULL,
+			(void *)&gain_constant_stk[TASK_STACKSIZE-1],
+			gain_constant_PRIORITY,
+			gain_constant_PRIORITY,
+			gain_constant_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);*/
+
+	OSTaskCreateExt(tracking_task,
+			NULL,
+			(void *)&tracking_stk[TASK_STACKSIZE-1],
+			tracking_PRIORITY,
+			tracking_PRIORITY,
+			tracking_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	OSTaskCreateExt(motor_setting_task,
+			NULL,
+			(void *)&motor_setting_stk[TASK_STACKSIZE-1],
+			motor_setting_PRIORITY,
+			motor_setting_PRIORITY,
+			motor_setting_stk,
+			TASK_STACKSIZE,
+			NULL,
+			0);
+
+	printf("Starting Tasks...\n\n");
+	OSStart();
+	return 0;
+}
+
+/* --------------------- FUNCTIONS ---------------------*/
+
+static void EncoderISR(void * isr_context, alt_u32 id) {
+	//Don't need to disable interrupts, because manager does it automatically.
+
+	//Need to clear edge interrupts, store first.
+	encoder_edges = IORD(PIO_ENCODER_BASE, 3);
+
+	//Also Read in High/Low values.
+	encoder_status = IORD(PIO_ENCODER_BASE, 0);
+
+	//Clear Edges
+	IOWR(PIO_ENCODER_BASE, 3, 0x0);
+
+	//Signal Semaphore to process encoder change.
+	OSSemPost(sem_encoder_change);
+
+}
+static void BeamISR(void * isr_context, alt_u32 id) {
+
+	//Need to clear edge interrupts, store first.
+	beam_edges = IORD(BEAM_BASE, 3);
+
+	//Also Read in High/Low values.
+	beam_status = IORD(BEAM_BASE, 0);
+
+	//Clear Edges
+	IOWR(BEAM_BASE, 3, 0x0);
+
+	//Save Times
+	//if(beamCount < 4)
+	//	Time[beamCount++] = GetMicrosecs();
+
+	//Signal Semaphore to process encoder change.
+	OSSemPost(sem_beam_change);
+
+}
+
+void addIntegratorValue(int a){
+	int i;
+	for (i = 0; i < bufferSize - 1; i++) {
+		integratorError[i] = integratorError[i+1];
+	}
+	integratorError[0] = a;
+}
+
+int	getIntegratorTotal(void){
+	int i, total;
+	for (i = 0; i < bufferSize; i++) {
+		total += integratorError[i];
+	}
+	return total;
+}
+
+//Writes a matlab file to view data with.
+void captureMatlabData() {
+	//Initial
+	printf("-------------------------------------------MATLAB SCRIPT-----------------------------------------------\n");
+	int i; //Looping
+	//printf("close all; clc; clear;\n");
+
+	//Data Read-in
+	printf("angle = [");	//Angle
+	for (i=0; i<dataPointer; i++) {
+		printf("%d ", dataStack[i]);
+		if(i%150==0) OSTimeDlyHMSM(0,0,0,10);
+	}
+	printf("%d];\n", dataStack[i]);
+	//
+	printf("voltage = [");	//Voltage
+	for (i=0; i<dataPointer; i++) {
+		printf("%d ", dataStack2[i]);
+		if(i%150==0) OSTimeDlyHMSM(0,0,0,10);
+	}
+	printf("%d];\n", dataStack2[i]);
+	printf("time = [");		//Time
+	for (i=0; i<dataPointer; i++) {
+		printf("%d ", dataStack3[i]);
+		if(i%150==0) OSTimeDlyHMSM(0,0,0,10);
+	}
+	printf("%d];\n", dataStack3[i]);
+	printf("Ki = %d;\nKp = %d;\nKd = %d;\n", Ki, Kp, Kd);
+	printf("\n");
+
+	//Data Processing
+	printf("figure\n");
+	printf("hold on;\n");
+	printf("plot(time(:), voltage(:), '.r');\n");
+	printf("plot(time(:), angle(:), '.');\n");
+	printf("hold off;\n");
+	printf("xlabel('Time (uS)');\n");
+	printf("ylabel('Amplitude');\n");
+	printf("legend('Voltage (\\pm512 Range Scale)','Angle (Turns)');\n");
+	printf("title(['Step Responce - Kp=' int2str(%d) ', Ki=' int2str(%d) ', Kd=' int2str(%d)]);\n",Kp, Ki, Kd);
+	printf("\n");
+	//Ending
+	//Confirmation
+}
+
+void zeiglerNicholsConstants() {
+	// Gain factors  NOTE THESE ARE DASHED VERSIONS.
+	//Generated from Zeigler Nichols Method.
+	int delT 	= 10; //10ms
+	int Kc 		= 12000/2;
+	int Pc 		= 260; //260ms period.
+
+	//The Gain Factors following are the discrete time variations.
+	Kp = (0.5 * Kc); //(0.6 * Kc);
+	Kd = (Kp * Pc / (8*delT));
+	Ki = 1.2*delT*Kp/Pc;	//Ki' = Ki * deltaT
+}
+
+int addOverflow(int a, int b) {
+	INT8U sign = (a>0);
+	if(((a>0)&&(b>0)&&((a+b)<0)) || ((a<0)&&(b<0)&&((a+b)>0))) {
+		return sign ? INT_MAX : INT_MIN; //2^31
+	}
+	return a+b;
+}
+
+int subOverflow(int a, int b){
+	INT8U sign = (a>0);
+	if((((a>0)&&(b<0)&&((a-b)<0)) || ((a<0)&&(b>0)&&((b-a)<0)))) {
+		return sign? INT_MAX : INT_MIN; //2^31
+	}
+	return a-b;
+}
+
+//Checks for multiplier overflow errors.
+int multOverflow(int a, int b) {
+	int MAXVAL = 2147483647; //2^31 // 2^32 = 4294967296;
+	INT8U sign = !((a<0)^(b<0));
+	if (a < 0)	a = -a;
+	if (b < 0)	b = -b;
+	if ((MAXVAL / a) > b)
+		return MAXVAL * sign;
+	return a*b;
+}
+
+//Functions Give Timing Functionality
+void InitMicrosecs(void) {
+	start_time = alt_up_parallel_port_read_data(usecs_dev);
+}
+int GetMicrosecs(void) {
+	return alt_up_parallel_port_read_data(usecs_dev) - start_time;
+}
+
+//Convert number to 7 segment vector
+char Seven_Display ( int value){
+	char  PORT_7_SEGMENT;
+	switch (value)
+	{
+	case 0:
+		PORT_7_SEGMENT=0x3F;
+		break;
+	case 1:
+		PORT_7_SEGMENT=0x06;
+		break;
+	case 2:
+		PORT_7_SEGMENT=0x5B;
+		break;
+	case 3:
+		PORT_7_SEGMENT=0x4F;
+		break;
+	case 4:
+		PORT_7_SEGMENT=0x66;
+		break;
+	case 5:
+		PORT_7_SEGMENT=0x6D;
+		break;
+	case 6:
+		PORT_7_SEGMENT=0x7D;
+		break;
+	case 7:
+		PORT_7_SEGMENT=0x07;
+		break;
+	case 8:
+		PORT_7_SEGMENT=0x7F;
+		break;
+	case 9:
+		PORT_7_SEGMENT=0x67;
+		break;
+	default:
+		PORT_7_SEGMENT=0x75;
+		break;
+	}
+	return PORT_7_SEGMENT;
+}
+
+int MultiSevenSeg (int value){
+	int Seg_value, i,j;
+	j=10;
+	if (value >= 0){
+		Seg_value = (Seven_Display((value/1)%10));
+		for(i=1; i<4 ; i++){
+			if((value/j)%10 != 0){
+				Seg_value|= (Seven_Display((value/j)%10)<<8*i);
+			}
+			else{
+				if(((value/(j*10))%10 != 0) || ((value/(j*100))%10 != 0) ){
+					Seg_value|= (Seven_Display((value/j)%10)<<8*i);
+				}
+			}
+			j=10*j;
+		}
+	}
+	else{
+		value = value*(-1);
+		Seg_value = (0x40<<(8))|(Seven_Display((value/1)%10));
+		for(i=1; i<3 ; i++){
+			if((value/j)%10 != 0){
+				Seg_value &= ~(0xFF<<8*i);
+				Seg_value|= (0x40<<(8*i+8))|(Seven_Display((value/j)%10)<<8*i);
+			}
+			else{
+				if((value/(j*10))%10 != 0){
+					Seg_value &= ~(0xFF<<8*i);
+					Seg_value|= (0x40<<(8*i+8))|(Seven_Display((value/j)%10)<<8*i);
+				}
+			}
+			j=10*j;
+		}
+	}
+	return Seg_value;
+}
+
+
+void OpenPortDevs(void){
+	usecs_dev = alt_up_parallel_port_open_dev("/dev/pio_useconds");
+	if (usecs_dev == NULL) printf("Failed to open usecs_dev\n");
+	else printf("Opened usecs_dev\n");
+
+	LEDGreen_dev = alt_up_parallel_port_open_dev("/dev/LEDGreen");
+	if (LEDGreen_dev == NULL) printf("Failed to open LEDGreen_dev\n");
+	else printf("Opened LEDGreen_dev\n");
+
+	LEDRed_dev = alt_up_parallel_port_open_dev("/dev/LEDRed");
+	if (LEDRed_dev == NULL) printf("Failed to open LEDRed_dev\n");
+	else printf("Opened LEDRed_dev\n");
+
+	HexDisplay3to0_dev = alt_up_parallel_port_open_dev("/dev/HexDisplay3to0");
+	if (HexDisplay3to0_dev == NULL) printf("Failed to open HexDisplay3to0_dev\n");
+	else printf("Opened HexDisplay3to0_dev\n");
+
+	HexDisplay7to4_dev = alt_up_parallel_port_open_dev("/dev/HexDisplay7to4");
+	if (HexDisplay7to4_dev == NULL) printf("Failed to open HexDisplay7to4_dev\n");
+	else printf("Opened HexDisplay7to4_dev\n");
+
+	KeyButtons_dev = alt_up_parallel_port_open_dev("/dev/KeyButtons");
+	if (KeyButtons_dev == NULL) printf("Failed to open KeyButtons_dev\n");
+	else printf("Opened KeyButtons_dev\n");
+
+	SliderSW_dev = alt_up_parallel_port_open_dev("/dev/SliderSW");
+	if (SliderSW_dev == NULL) printf("Failed to open SliderSW_dev\n");
+	else printf("Opened SliderSW_dev\n");
+
+	jtag_uart_0_dev = alt_up_parallel_port_open_dev("/dev/jtag_uart_0");
+	if (jtag_uart_0_dev == NULL) printf("Failed to open jtag_uart_0_dev\n");
+	else printf("Opened jtag_uart_0_dev\n");
+
+	jtag_uart_0_dev = alt_up_parallel_port_open_dev("/dev/jtag_uart_0");
+	if (jtag_uart_0_dev == NULL) printf("Failed to open jtag_uart_0_dev\n");
+	else printf("Opened jtag_uart_0_dev\n");
+
+	pio_encoder_dev = alt_up_parallel_port_open_dev("/dev/pio_encoder");
+	if (pio_encoder_dev == NULL) printf("Failed to open dev/pio_encoder\n");
+	else printf("Opened pio_encoder_dev\n");
+
+	motor_voltage_dev = alt_up_parallel_port_open_dev("/dev/motor_voltage");
+	if (motor_voltage_dev == NULL) printf("Failed to open motor_voltage_dev\n");
+	else printf("Opened motor_voltage_dev\n");
+
+	beam_dev = alt_up_parallel_port_open_dev("/dev/beam");
+	if (motor_voltage_dev == NULL) printf("Failed to open beam_dev\n");
+	else printf("Opened beam_dev\n");
+
+	printf("\n");
+}
+
+void CE(INT32U x) {
+	if ((err = x) != OS_NO_ERR) \
+			printf("Runtime error: %d line %d - see ucos_ii.h\n", err, __LINE__);
+}
